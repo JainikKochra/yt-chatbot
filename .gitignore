@@ -3,7 +3,7 @@
 __pycache__/
 *.pyc
 .DS_Store
-projcts/faiss_index/
+projcts/
 .vscode/
 
 myenv/

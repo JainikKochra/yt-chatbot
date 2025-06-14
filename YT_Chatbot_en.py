@@ -5,21 +5,19 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import PromptTemplate
 from langchain_community.vectorstores import FAISS
 from langchain_core.output_parsers import StrOutputParser
-from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 import re
 import os
-from dotenv import load_dotenv
-
+import tempfile
 import subprocess
 import webvtt
 
-load_dotenv()
-GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
-
-st.set_page_config(page_title="🎬 YouTube Chat Assistant", layout="centered",page_icon="▶️")
+# Initialize Streamlit
+st.set_page_config(page_title="🎬 YouTube Chat Assistant", layout="centered", page_icon="▶️")
 st.title("🎥 YouTube Q&A Chatbot")
 
+# Get Google API key from secrets
+GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
 
 # Single input field for YouTube URL or ID
 raw_input = st.text_input("Enter YouTube URL or ID", key="youtube_input")
@@ -33,56 +31,73 @@ else:
     st.warning("⚠️ Please enter a valid YouTube URL or 11-character video ID.")
     st.stop()
 
-# Fetch and parse subtitles using yt-dlp
-def get_transcript_via_ytdlp(video_id):
-    subtitle_dir = "./projcts/subtitles"
-    os.makedirs(subtitle_dir, exist_ok=True)
-    subtitle_path = os.path.join(subtitle_dir, f"{video_id}.en.vtt")
-
-    if not os.path.exists(subtitle_path):
+# Improved subtitle fetching function with Streamlit Cloud compatibility
+def get_transcript(video_id):
+    # Create a temporary directory for Streamlit Cloud
+    with tempfile.TemporaryDirectory() as temp_dir:
+        subtitle_path = os.path.join(temp_dir, f"{video_id}.en.vtt")
+        
         try:
-            subprocess.run([
+            # Download subtitles
+            result = subprocess.run([
                 "yt-dlp",
                 f"https://www.youtube.com/watch?v={video_id}",
                 "--write-auto-sub",
                 "--sub-lang", "en",
                 "--skip-download",
-                "-o", os.path.join(subtitle_dir, f"{video_id}.%(ext)s")
-            ], check=True)
-        except subprocess.CalledProcessError:
-            st.error("❌ Failed to download subtitles using yt-dlp.")
+                "--convert-subs", "vtt",
+                "-o", os.path.join(temp_dir, f"{video_id}.%(ext)s")
+            ], capture_output=True, text=True, check=True)
+            
+            # Check if subtitle file exists
+            if not os.path.exists(subtitle_path):
+                st.error(f"Subtitle file not found at {subtitle_path}")
+                return None
+                
+            # Read and parse VTT file
+            captions = []
+            for caption in webvtt.read(subtitle_path):
+                text = caption.text.strip()
+                # Remove any formatting tags
+                text = re.sub(r'<[^>]+>', '', text)
+                captions.append(text)
+                
+            return " ".join(captions)
+            
+        except subprocess.CalledProcessError as e:
+            st.error(f"yt-dlp error: {e.stderr}")
             return None
-
-    try:
-        captions = [caption.text.strip() for caption in webvtt.read(subtitle_path)]
-        return " ".join(captions)
-    except Exception:
-        st.error("❌ Failed to parse the subtitle file.")
-        return None
+        except Exception as e:
+            st.error(f"Error processing subtitles: {str(e)}")
+            return None
 
 @st.cache_resource
 def load_or_create_index(video_id):
     embeddings_model = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-    index_path = f"./projcts/faiss_index"
+    
+    # Use temp directory for Streamlit Cloud
+    with tempfile.TemporaryDirectory() as temp_dir:
+        index_path = os.path.join(temp_dir, f"faiss_index_{video_id}")
+        
+        if os.path.exists(index_path):
+            vector_store = FAISS.load_local(index_path, embeddings_model, allow_dangerous_deserialization=True)
+        else:
+            text = get_transcript(video_id)
+            if not text:
+                return None
 
-    if os.path.exists(index_path):
-        vector_store = FAISS.load_local(index_path, embeddings_model, allow_dangerous_deserialization=True)
-    else:
-        text = get_transcript_via_ytdlp(video_id)
-        if not text:
-            return None
-
-        splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-        chunks = splitter.create_documents([text])
-        vector_store = FAISS.from_documents(chunks, embeddings_model)
-        vector_store.save_local(index_path)
-
-    return vector_store
+            splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+            chunks = splitter.create_documents([text])
+            vector_store = FAISS.from_documents(chunks, embeddings_model)
+            vector_store.save_local(index_path)
+            
+        return vector_store
 
 # Load vector store
 if video_id:
     vector_store = load_or_create_index(video_id)
     if not vector_store:
+        st.error("❌ Could not process video subtitles. Please try another video.")
         st.stop()
 else:
     st.stop()
@@ -122,7 +137,7 @@ if len(st.session_state.chat_history) == 0:
     with st.chat_message("assistant"):
         st.markdown("Hi! Ask me anything about the video 📽️")
 
-# Display chat history excluding the initial assistant message
+# Display chat history
 for msg in st.session_state.chat_history:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
@@ -138,7 +153,9 @@ if user_input:
     # Get assistant response
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
-            answer = qa_chain.invoke(user_input)
-            st.markdown(answer)
-            st.session_state.chat_history.append({"role": "assistant", "content": answer})
-
+            try:
+                answer = qa_chain.invoke(user_input)
+                st.markdown(answer)
+                st.session_state.chat_history.append({"role": "assistant", "content": answer})
+            except Exception as e:
+                st.error(f"❌ Error generating response: {str(e)}")
