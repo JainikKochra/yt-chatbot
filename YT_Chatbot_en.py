@@ -11,6 +11,8 @@ import re
 import os
 from dotenv import load_dotenv
 
+import subprocess
+import webvtt
 
 load_dotenv()
 GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
@@ -31,6 +33,33 @@ else:
     st.warning("⚠️ Please enter a valid YouTube URL or 11-character video ID.")
     st.stop()
 
+# Fetch and parse subtitles using yt-dlp
+def get_transcript_via_ytdlp(video_id):
+    subtitle_dir = "./projcts/subtitles"
+    os.makedirs(subtitle_dir, exist_ok=True)
+    subtitle_path = os.path.join(subtitle_dir, f"{video_id}.en.vtt")
+
+    if not os.path.exists(subtitle_path):
+        try:
+            subprocess.run([
+                "yt-dlp",
+                f"https://www.youtube.com/watch?v={video_id}",
+                "--write-auto-sub",
+                "--sub-lang", "en",
+                "--skip-download",
+                "-o", os.path.join(subtitle_dir, f"{video_id}.%(ext)s")
+            ], check=True)
+        except subprocess.CalledProcessError:
+            st.error("❌ Failed to download subtitles using yt-dlp.")
+            return None
+
+    try:
+        captions = [caption.text.strip() for caption in webvtt.read(subtitle_path)]
+        return " ".join(captions)
+    except Exception:
+        st.error("❌ Failed to parse the subtitle file.")
+        return None
+
 @st.cache_resource
 def load_or_create_index(video_id):
     embeddings_model = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
@@ -39,11 +68,8 @@ def load_or_create_index(video_id):
     if os.path.exists(index_path):
         vector_store = FAISS.load_local(index_path, embeddings_model, allow_dangerous_deserialization=True)
     else:
-        try:
-            transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=['en'])
-            text = " ".join(chunk["text"] for chunk in transcript)
-        except TranscriptsDisabled:
-            st.error("Transcript not available for this video.")
+        text = get_transcript_via_ytdlp(video_id)
+        if not text:
             return None
 
         splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
@@ -56,6 +82,8 @@ def load_or_create_index(video_id):
 # Load vector store
 if video_id:
     vector_store = load_or_create_index(video_id)
+    if not vector_store:
+        st.stop()
 else:
     st.stop()
 
